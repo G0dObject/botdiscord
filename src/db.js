@@ -35,6 +35,12 @@ db.exec(`
   );
 `);
 
+for (const column of ['last_message_reward', 'last_voice_reward']) {
+  try { db.exec(`ALTER TABLE users ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`); } catch (error) {
+    if (!error.message.includes('duplicate column name')) throw error;
+  }
+}
+
 const count = db.prepare('SELECT COUNT(*) AS count FROM items').get().count;
 if (!count) {
   const insert = db.prepare('INSERT INTO items (name, description, price, icon, stock) VALUES (?, ?, ?, ?, ?)');

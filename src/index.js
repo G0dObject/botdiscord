@@ -30,6 +30,21 @@ app.get('/api/stats', auth, (req, res) => {
 });
 
 app.get('/api/users', auth, (req, res) => res.json(db.prepare('SELECT * FROM users ORDER BY balance DESC LIMIT 100').all()));
+app.post('/api/users/:id/balance', auth, (req, res) => {
+  const amount = Number(req.body.amount);
+  if (!Number.isInteger(amount) || amount === 0) return res.status(400).json({ error: 'Укажи целое ненулевое количество монет' });
+  if (!db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.id)) ensureUser(req.params.id, req.body.username || 'Unknown');
+  db.prepare('UPDATE users SET balance = MAX(0, balance + ?) WHERE id = ?').run(amount, req.params.id);
+  res.json(db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id));
+});
+app.post('/api/users/:id/items', auth, (req, res) => {
+  const itemId = Number(req.body.itemId); const quantity = Number(req.body.quantity);
+  if (!Number.isInteger(itemId) || !Number.isInteger(quantity) || quantity <= 0) return res.status(400).json({ error: 'Неверный предмет или количество' });
+  if (!db.prepare('SELECT id FROM items WHERE id = ?').get(itemId)) return res.status(404).json({ error: 'Предмет не найден' });
+  if (!db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.id)) ensureUser(req.params.id, req.body.username || 'Unknown');
+  db.prepare('INSERT INTO inventory (user_id, item_id, quantity) VALUES (?, ?, ?) ON CONFLICT(user_id, item_id) DO UPDATE SET quantity = quantity + excluded.quantity').run(req.params.id, itemId, quantity);
+  res.json({ ok: true });
+});
 app.get('/api/items', auth, (req, res) => res.json(db.prepare('SELECT * FROM items ORDER BY active DESC, id DESC').all()));
 app.post('/api/items', auth, (req, res) => {
   const { name, description = '', price = 0, icon = '◆', stock = -1 } = req.body;
@@ -49,10 +64,11 @@ const commands = [
   new SlashCommandBuilder().setName('daily').setDescription('Получить ежедневную награду'),
   new SlashCommandBuilder().setName('shop').setDescription('Открыть магазин предметов'),
   new SlashCommandBuilder().setName('buy').setDescription('Купить предмет').addIntegerOption(o => o.setName('item_id').setDescription('ID предмета').setRequired(true)),
-  new SlashCommandBuilder().setName('inventory').setDescription('Показать инвентарь')
+  new SlashCommandBuilder().setName('inventory').setDescription('Показать инвентарь'),
+  new SlashCommandBuilder().setName('capitalization').setDescription('Показать общую капитализацию сервера')
 ].map(command => command.toJSON());
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildVoiceStates] });
 client.once('ready', async () => {
   console.log(`Discord: ${client.user.tag}`);
   if (process.env.CLIENT_ID && process.env.GUILD_ID) await new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN).put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), { body: commands });
@@ -61,6 +77,11 @@ client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
   const user = ensureUser(interaction.user.id, interaction.user.username);
   if (interaction.commandName === 'balance') return interaction.reply(`**${interaction.user.username}**\nБаланс: **${user.balance.toLocaleString()} ✦**\nУровень: **${user.level}** · XP: ${user.xp % 500}/500`);
+  if (interaction.commandName === 'capitalization') {
+    const coins = db.prepare('SELECT COALESCE(SUM(balance), 0) total FROM users').get().total;
+    const items = db.prepare('SELECT COALESCE(SUM(inv.quantity * i.price), 0) total FROM inventory inv JOIN items i ON i.id = inv.item_id').get().total;
+    return interaction.reply(`**Капитализация сервера**\nМонеты на балансах: **${coins.toLocaleString()} ✦**\nСтоимость предметов: **${items.toLocaleString()} ✦**\nИтого: **${(coins + items).toLocaleString()} ✦**`);
+  }
   if (interaction.commandName === 'daily') {
     if (Date.now() - user.last_daily < 86400000) return interaction.reply({ content: 'Ты уже забрал daily. Возвращайся завтра.', ephemeral: true });
     const reward = 250 + user.level * 50;
@@ -83,6 +104,29 @@ client.on('interactionCreate', async interaction => {
     return interaction.reply(`Куплено: ${item.icon} **${item.name}** за ${item.price.toLocaleString()} ✦.`);
   }
 });
+
+client.on('messageCreate', message => {
+  if (message.author.bot || !message.guild) return;
+  const user = ensureUser(message.author.id, message.author.username);
+  if (Date.now() - user.last_message_reward < 60000) return;
+  db.prepare('UPDATE users SET balance = balance + 5, last_message_reward = ? WHERE id = ?').run(Date.now(), user.id);
+  addXp(user.id, 10);
+});
+
+const rewardVoiceMembers = () => {
+  for (const guild of client.guilds.cache.values()) {
+    for (const channel of guild.channels.cache.filter(channel => channel.isVoiceBased()).values()) {
+      for (const member of channel.members.values()) {
+        if (member.user.bot || member.voice.selfDeaf && member.voice.serverDeaf) continue;
+        const user = ensureUser(member.id, member.user.username);
+        if (Date.now() - user.last_voice_reward < 300000) continue;
+        db.prepare('UPDATE users SET balance = balance + 10, last_voice_reward = ? WHERE id = ?').run(Date.now(), member.id);
+        addXp(member.id, 20);
+      }
+    }
+  }
+};
+client.once('ready', () => setInterval(rewardVoiceMembers, 60000));
 
 app.listen(port, () => console.log(`Admin panel: http://localhost:${port}`));
 if (process.env.DISCORD_TOKEN) client.login(process.env.DISCORD_TOKEN).catch(error => console.error('Discord login failed:', error.message));
