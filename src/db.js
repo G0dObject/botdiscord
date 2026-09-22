@@ -4,6 +4,7 @@ const uri = process.env.MONGODB_URI;
 const databaseName = 'guildforge';
 let client;
 let database;
+let connection;
 
 const defaultItems = [
   ['Эликсир удачи', 'Увеличивает награду за daily на 25%.', 750, '✦', 25],
@@ -15,20 +16,32 @@ const defaultItems = [
 async function connectDb() {
   if (database) return database;
   if (!uri) throw new Error('MONGODB_URI is required. Add it to your environment before starting Guildforge.');
-  client = new MongoClient(uri);
-  await client.connect();
-  database = client.db(databaseName);
-  await Promise.all([
-    database.collection('inventory').createIndex({ user_id: 1, item_id: 1 }, { unique: true }),
-    database.collection('game_stats').createIndex({ user_id: 1, game: 1 }, { unique: true }),
-    database.collection('achievements').createIndex({ user_id: 1, code: 1 }, { unique: true }),
-    database.collection('promo_claims').createIndex({ code: 1, user_id: 1 }, { unique: true })
-  ]);
-  if (!await database.collection('items').countDocuments()) {
-    await database.collection('items').insertMany(defaultItems.map(([name, description, price, icon, stock], index) => ({ _id: index + 1, id: index + 1, name, description, price, icon, stock, active: 1 })));
-    await database.collection('counters').updateOne({ _id: 'items' }, { $max: { value: defaultItems.length } }, { upsert: true });
+  if (connection) return connection;
+  connection = (async () => {
+    client = new MongoClient(uri, { serverSelectionTimeoutMS: 10000 });
+    await client.connect();
+    database = client.db(databaseName);
+    await Promise.all([
+      database.collection('inventory').createIndex({ user_id: 1, item_id: 1 }, { unique: true }),
+      database.collection('game_stats').createIndex({ user_id: 1, game: 1 }, { unique: true }),
+      database.collection('achievements').createIndex({ user_id: 1, code: 1 }, { unique: true }),
+      database.collection('promo_claims').createIndex({ code: 1, user_id: 1 }, { unique: true })
+    ]);
+    if (!await database.collection('items').countDocuments()) {
+      await database.collection('items').insertMany(defaultItems.map(([name, description, price, icon, stock], index) => ({ _id: index + 1, id: index + 1, name, description, price, icon, stock, active: 1 })));
+      await database.collection('counters').updateOne({ _id: 'items' }, { $max: { value: defaultItems.length } }, { upsert: true });
+    }
+    return database;
+  })();
+  try {
+    return await connection;
+  } catch (error) {
+    connection = null;
+    database = null;
+    if (client) await client.close().catch(() => {});
+    client = null;
+    throw error;
   }
-  return database;
 }
 
 function db() {

@@ -71,5 +71,16 @@ client.on('interactionCreate', async interaction => { try {
 client.on('messageCreate', async message => { if (message.author.bot || !message.guild) return; const user = await ensureUser(message.author.id, message.author.username); if (Date.now() - user.last_message_reward < 60000) return; await users().updateOne({ _id: user.id }, { $inc: { balance: 5 }, $set: { last_message_reward: Date.now() } }); await addXp(user.id, 10); });
 const rewardVoiceMembers = async () => { for (const guild of client.guilds.cache.values()) for (const channel of guild.channels.cache.filter(channel => channel.isVoiceBased()).values()) for (const member of channel.members.values()) { if (member.user.bot || member.voice.selfDeaf && member.voice.serverDeaf) continue; const user = await ensureUser(member.id, member.user.username); if (Date.now() - user.last_voice_reward < 300000) continue; await users().updateOne({ _id: user.id }, { $inc: { balance: 10 }, $set: { last_voice_reward: Date.now() } }); await addXp(user.id, 20); } };
 client.once('ready', () => setInterval(() => rewardVoiceMembers().catch(error => console.error('Voice rewards failed:', error)), 60000));
-async function start() { await connectDb(); app.listen(port, () => console.log(`Admin panel: http://localhost:${port}`)); if (process.env.DISCORD_TOKEN) client.login(process.env.DISCORD_TOKEN).catch(error => console.error('Discord login failed:', error.message)); }
-start().catch(error => { console.error('Startup failed:', error.message); process.exitCode = 1; });
+function connectMongoWithRetry() {
+  connectDb().then(() => console.log('MongoDB connected')).catch(error => {
+    console.error('MongoDB connection failed, retrying in 30 seconds:', error.message);
+    setTimeout(connectMongoWithRetry, 30000);
+  });
+}
+
+function start() {
+  app.listen(port, () => console.log(`Admin panel: http://localhost:${port}`));
+  connectMongoWithRetry();
+  if (process.env.DISCORD_TOKEN) client.login(process.env.DISCORD_TOKEN).catch(error => console.error('Discord login failed:', error.message));
+}
+start();
