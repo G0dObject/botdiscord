@@ -33,6 +33,12 @@ db.exec(`
     PRIMARY KEY (user_id, item_id),
     FOREIGN KEY (item_id) REFERENCES items(id)
   );
+  CREATE TABLE IF NOT EXISTS roulette_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    number INTEGER NOT NULL,
+    color TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
 `);
 
 for (const column of ['last_message_reward', 'last_voice_reward']) {
