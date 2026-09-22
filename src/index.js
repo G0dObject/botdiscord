@@ -2,7 +2,7 @@ require('dotenv').config();
 const path = require('path');
 const express = require('express');
 const jwt = require('jsonwebtoken');
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { db, ensureUser, addXp } = require('./db');
 
 const app = express();
@@ -65,15 +65,45 @@ const commands = [
   new SlashCommandBuilder().setName('shop').setDescription('Открыть магазин предметов'),
   new SlashCommandBuilder().setName('buy').setDescription('Купить предмет').addIntegerOption(o => o.setName('item_id').setDescription('ID предмета').setRequired(true)),
   new SlashCommandBuilder().setName('inventory').setDescription('Показать инвентарь'),
-  new SlashCommandBuilder().setName('capitalization').setDescription('Показать общую капитализацию сервера')
+  new SlashCommandBuilder().setName('capitalization').setDescription('Показать общую капитализацию сервера'),
+  new SlashCommandBuilder().setName('roulette').setDescription('Сделать ставку на число').addIntegerOption(o => o.setName('bet').setDescription('Размер ставки в монетах').setMinValue(1).setRequired(true))
 ].map(command => command.toJSON());
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildVoiceStates] });
+const redNumbers = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
+const rouletteColor = number => number === 0 ? 'зеро' : redNumbers.has(number) ? 'красное' : 'чёрное';
+const rouletteButton = (number, ownerId, bet, page) => new ButtonBuilder()
+  .setCustomId(`roulette:${ownerId}:${bet}:${page}:${number}`)
+  .setLabel(String(number))
+  .setStyle(number === 0 ? ButtonStyle.Success : redNumbers.has(number) ? ButtonStyle.Danger : ButtonStyle.Secondary);
+const rouletteRows = (ownerId, bet, page) => {
+  const start = page === 0 ? 0 : 19;
+  const numbers = Array.from({ length: page === 0 ? 19 : 18 }, (_, index) => start + index);
+  const rows = [];
+  for (let index = 0; index < numbers.length; index += 5) rows.push(new ActionRowBuilder().addComponents(numbers.slice(index, index + 5).map(n => rouletteButton(n, ownerId, bet, page))));
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`roulette-page:${ownerId}:${bet}:0`).setLabel('0–18').setStyle(page === 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`roulette-page:${ownerId}:${bet}:1`).setLabel('19–36').setStyle(page === 1 ? ButtonStyle.Primary : ButtonStyle.Secondary)
+  ));
+  return rows;
+};
 client.once('ready', async () => {
   console.log(`Discord: ${client.user.tag}`);
   if (process.env.CLIENT_ID && process.env.GUILD_ID) await new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN).put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), { body: commands });
 });
 client.on('interactionCreate', async interaction => {
+  if (interaction.isButton()) {
+    const parts = interaction.customId.split(':');
+    if (!parts[0].startsWith('roulette')) return;
+    if (parts[1] !== interaction.user.id) return interaction.reply({ content: 'Эта рулетка создана другим игроком.', ephemeral: true });
+    if (parts[0] === 'roulette-page') return interaction.update({ components: rouletteRows(parts[1], Number(parts[2]), Number(parts[3])) });
+    const bet = Number(parts[2]); const selected = Number(parts[4]); const player = ensureUser(interaction.user.id, interaction.user.username);
+    if (player.balance < bet) return interaction.reply({ content: 'Ставка больше твоего баланса.', ephemeral: true });
+    const result = Math.floor(Math.random() * 37); const won = result === selected; const payout = won ? bet * 36 : 0;
+    db.prepare('UPDATE users SET balance = balance - ? + ? WHERE id = ?').run(bet, payout, player.id);
+    if (won) addXp(player.id, 25);
+    return interaction.update({ content: `🎰 Выпало **${result}** — ${rouletteColor(result)}.\n${won ? `🎉 Выигрыш: **${payout.toLocaleString()} ✦**` : `Потеряно: **${bet.toLocaleString()} ✦**`}`, components: [] });
+  }
   if (!interaction.isChatInputCommand()) return;
   const user = ensureUser(interaction.user.id, interaction.user.username);
   if (interaction.commandName === 'balance') return interaction.reply(`**${interaction.user.username}**\nБаланс: **${user.balance.toLocaleString()} ✦**\nУровень: **${user.level}** · XP: ${user.xp % 500}/500`);
@@ -81,6 +111,11 @@ client.on('interactionCreate', async interaction => {
     const coins = db.prepare('SELECT COALESCE(SUM(balance), 0) total FROM users').get().total;
     const items = db.prepare('SELECT COALESCE(SUM(inv.quantity * i.price), 0) total FROM inventory inv JOIN items i ON i.id = inv.item_id').get().total;
     return interaction.reply(`**Капитализация сервера**\nМонеты на балансах: **${coins.toLocaleString()} ✦**\nСтоимость предметов: **${items.toLocaleString()} ✦**\nИтого: **${(coins + items).toLocaleString()} ✦**`);
+  }
+  if (interaction.commandName === 'roulette') {
+    const bet = interaction.options.getInteger('bet');
+    if (user.balance < bet) return interaction.reply({ content: `Для ставки нужно ещё ${(bet - user.balance).toLocaleString()} ✦.`, ephemeral: true });
+    return interaction.reply({ content: `🎰 **Рулетка**\nСтавка: **${bet.toLocaleString()} ✦**\nВыбери число: красные кнопки — красные числа, серые — чёрные, зелёная — зеро.`, components: rouletteRows(user.id, bet, 0) });
   }
   if (interaction.commandName === 'daily') {
     if (Date.now() - user.last_daily < 86400000) return interaction.reply({ content: 'Ты уже забрал daily. Возвращайся завтра.', ephemeral: true });
