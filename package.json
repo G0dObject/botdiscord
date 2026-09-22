@@ -5,13 +5,17 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "migrate:sqlite-to-mongo": "node scripts/migrate-sqlite-to-mongo.js"
   },
   "dependencies": {
-    "better-sqlite3": "^11.7.0",
     "discord.js": "^14.16.3",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "mongodb": "^6.15.0"
+  },
+  "devDependencies": {
+    "better-sqlite3": "^11.7.0"
   }
 }

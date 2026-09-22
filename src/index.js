@@ -2,179 +2,67 @@ require('dotenv').config();
 const path = require('path');
 const express = require('express');
 const jwt = require('jsonwebtoken');
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-const { db, ensureUser, addXp } = require('./db');
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
+const { connectDb, collections, ensureUser, addXp, logAudit, recordGame, unlockAchievement } = require('./db');
 
 const app = express();
 const port = process.env.PORT || 3000;
 const jwtSecret = process.env.JWT_SECRET || 'local-development-secret';
-app.use(express.json());
-app.use(express.static(path.join(__dirname, '..', 'public')));
+const users = () => collections.users;
+const items = () => collections.items;
+const inventory = () => collections.inventory;
+const gameStats = () => collections.game_stats;
+const achievements = () => collections.achievements;
+const promos = () => collections.promocodes;
+const claims = () => collections.promo_claims;
+const auctions = () => collections.auctions;
+app.use(express.json()); app.use(express.static(path.join(__dirname, '..', 'public')));
+const auth = (req, res, next) => { const token = (req.headers.authorization || '').replace('Bearer ', ''); try { req.admin = jwt.verify(token, jwtSecret); next(); } catch { res.status(401).json({ error: 'Требуется авторизация' }); } };
 
-const auth = (req, res, next) => {
-  const token = (req.headers.authorization || '').replace('Bearer ', '');
-  try { req.admin = jwt.verify(token, jwtSecret); next(); } catch { res.status(401).json({ error: 'Требуется авторизация' }); }
-};
+app.post('/api/login', (req, res) => { if (!process.env.ADMIN_PASSWORD || req.body.password !== process.env.ADMIN_PASSWORD) return res.status(401).json({ error: 'Неверный пароль' }); res.json({ token: jwt.sign({ role: 'admin' }, jwtSecret, { expiresIn: '12h' }) }); });
+app.get('/api/stats', auth, async (req, res, next) => { try { const [stats] = await users().aggregate([{ $group: { _id: null, users: { $sum: 1 }, balance: { $sum: '$balance' }, level: { $avg: '$level' } } }]); const [purchases] = await inventory().aggregate([{ $group: { _id: null, total: { $sum: '$quantity' } } }]); res.json({ users: stats?.users || 0, balance: stats?.balance || 0, averageLevel: Number(stats?.level || 0).toFixed(1), purchases: purchases?.total || 0 }); } catch (error) { next(error); } });
+app.get('/api/users', auth, async (req, res, next) => { try { res.json(await users().find({}, { sort: { balance: -1 }, limit: 100, projection: { _id: 0 } })); } catch (error) { next(error); } });
+app.post('/api/users/:id/balance', auth, async (req, res, next) => { try { const amount = Number(req.body.amount); if (!Number.isInteger(amount) || amount === 0) return res.status(400).json({ error: 'Укажи целое ненулевое количество монет' }); await ensureUser(req.params.id, req.body.username || 'Unknown'); await users().updateOne({ _id: req.params.id }, [{ $set: { balance: { $max: [0, { $add: ['$balance', amount] }] } } }]); await logAudit('balance_adjustment', req.params.id, amount, 'Админ-панель'); res.json(await users().findOne({ _id: req.params.id }, { projection: { _id: 0 } })); } catch (error) { next(error); } });
+app.post('/api/users/:id/items', auth, async (req, res, next) => { try { const itemId = Number(req.body.itemId); const quantity = Number(req.body.quantity); if (!Number.isInteger(itemId) || !Number.isInteger(quantity) || quantity <= 0) return res.status(400).json({ error: 'Неверный предмет или количество' }); if (!await items().findOne({ id: itemId })) return res.status(404).json({ error: 'Предмет не найден' }); await ensureUser(req.params.id, req.body.username || 'Unknown'); await inventory().updateOne({ user_id: req.params.id, item_id: itemId }, { $inc: { quantity }, $setOnInsert: { _id: `${req.params.id}:${itemId}`, user_id: req.params.id, item_id: itemId } }, { upsert: true }); await logAudit('item_grant', req.params.id, quantity, `Предмет #${itemId}`); res.json({ ok: true }); } catch (error) { next(error); } });
+app.get('/api/items', auth, async (req, res, next) => { try { res.json(await items().find({}, { sort: { active: -1, id: -1 }, projection: { _id: 0 } })); } catch (error) { next(error); } });
+app.post('/api/items', auth, async (req, res, next) => { try { const { name, description = '', price = 0, icon = '◆', stock = -1 } = req.body; if (!name) return res.status(400).json({ error: 'Название обязательно' }); const item = { name, description, price: Number(price), icon, stock: Number(stock), active: 1 }; await items().insertOne(item); res.json({ ...item, _id: undefined }); } catch (error) { next(error); } });
+app.patch('/api/items/:id', auth, async (req, res, next) => { try { const update = {}; for (const key of ['name', 'description', 'price', 'icon', 'stock', 'active']) if (req.body[key] !== undefined) update[key] = req.body[key]; await items().updateOne({ id: Number(req.params.id) }, { $set: update }); res.json(await items().findOne({ id: Number(req.params.id) }, { projection: { _id: 0 } })); } catch (error) { next(error); } });
+app.delete('/api/items/:id', auth, async (req, res, next) => { try { await items().deleteOne({ id: Number(req.params.id) }); res.json({ ok: true }); } catch (error) { next(error); } });
+app.get('/api/audit', auth, async (req, res, next) => { try { res.json(await collections.audit_log.find({}, { sort: { id: -1 }, limit: 100, projection: { _id: 0 } })); } catch (error) { next(error); } });
+app.post('/api/promocodes', auth, async (req, res, next) => { try { const code = String(req.body.code || '').trim().toUpperCase(); const reward = Number(req.body.reward); const maxUses = Number(req.body.maxUses || 1); if (!/^[A-Z0-9_-]{3,32}$/.test(code) || !Number.isInteger(reward) || reward < 1 || !Number.isInteger(maxUses) || maxUses < 1) return res.status(400).json({ error: 'Неверные данные промокода' }); await promos().insertOne({ _id: code, code, reward, max_uses: maxUses, uses: 0, active: 1, expires_at: null }); await logAudit('promocode_create', null, reward, code); res.json({ ok: true }); } catch (error) { next(error); } });
+app.use((error, req, res, next) => { console.error(error); res.status(500).json({ error: 'Внутренняя ошибка сервера' }); });
 
-app.post('/api/login', (req, res) => {
-  if (!process.env.ADMIN_PASSWORD || req.body.password !== process.env.ADMIN_PASSWORD) return res.status(401).json({ error: 'Неверный пароль' });
-  res.json({ token: jwt.sign({ role: 'admin' }, jwtSecret, { expiresIn: '12h' }) });
-});
-
-app.get('/api/stats', auth, (req, res) => {
-  const users = db.prepare('SELECT COUNT(*) count FROM users').get().count;
-  const balance = db.prepare('SELECT COALESCE(SUM(balance), 0) total FROM users').get().total;
-  const level = db.prepare('SELECT COALESCE(AVG(level), 0) average FROM users').get().average;
-  const purchases = db.prepare('SELECT COALESCE(SUM(quantity), 0) total FROM inventory').get().total;
-  res.json({ users, balance, averageLevel: Number(level).toFixed(1), purchases });
-});
-
-app.get('/api/users', auth, (req, res) => res.json(db.prepare('SELECT * FROM users ORDER BY balance DESC LIMIT 100').all()));
-app.post('/api/users/:id/balance', auth, (req, res) => {
-  const amount = Number(req.body.amount);
-  if (!Number.isInteger(amount) || amount === 0) return res.status(400).json({ error: 'Укажи целое ненулевое количество монет' });
-  if (!db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.id)) ensureUser(req.params.id, req.body.username || 'Unknown');
-  db.prepare('UPDATE users SET balance = MAX(0, balance + ?) WHERE id = ?').run(amount, req.params.id);
-  res.json(db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id));
-});
-app.post('/api/users/:id/items', auth, (req, res) => {
-  const itemId = Number(req.body.itemId); const quantity = Number(req.body.quantity);
-  if (!Number.isInteger(itemId) || !Number.isInteger(quantity) || quantity <= 0) return res.status(400).json({ error: 'Неверный предмет или количество' });
-  if (!db.prepare('SELECT id FROM items WHERE id = ?').get(itemId)) return res.status(404).json({ error: 'Предмет не найден' });
-  if (!db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.id)) ensureUser(req.params.id, req.body.username || 'Unknown');
-  db.prepare('INSERT INTO inventory (user_id, item_id, quantity) VALUES (?, ?, ?) ON CONFLICT(user_id, item_id) DO UPDATE SET quantity = quantity + excluded.quantity').run(req.params.id, itemId, quantity);
-  res.json({ ok: true });
-});
-app.get('/api/items', auth, (req, res) => res.json(db.prepare('SELECT * FROM items ORDER BY active DESC, id DESC').all()));
-app.post('/api/items', auth, (req, res) => {
-  const { name, description = '', price = 0, icon = '◆', stock = -1 } = req.body;
-  if (!name) return res.status(400).json({ error: 'Название обязательно' });
-  const result = db.prepare('INSERT INTO items (name, description, price, icon, stock) VALUES (?, ?, ?, ?, ?)').run(name, description, Number(price), icon, Number(stock));
-  res.json(db.prepare('SELECT * FROM items WHERE id = ?').get(result.lastInsertRowid));
-});
-app.patch('/api/items/:id', auth, (req, res) => {
-  const { name, description, price, icon, stock, active } = req.body;
-  db.prepare('UPDATE items SET name = COALESCE(?, name), description = COALESCE(?, description), price = COALESCE(?, price), icon = COALESCE(?, icon), stock = COALESCE(?, stock), active = COALESCE(?, active) WHERE id = ?').run(name, description, price, icon, stock, active, req.params.id);
-  res.json(db.prepare('SELECT * FROM items WHERE id = ?').get(req.params.id));
-});
-app.delete('/api/items/:id', auth, (req, res) => { db.prepare('DELETE FROM items WHERE id = ?').run(req.params.id); res.json({ ok: true }); });
-
-const commands = [
-  new SlashCommandBuilder().setName('balance').setDescription('Показать баланс и уровень'),
-  new SlashCommandBuilder().setName('daily').setDescription('Получить ежедневную награду'),
-  new SlashCommandBuilder().setName('shop').setDescription('Открыть магазин предметов'),
-  new SlashCommandBuilder().setName('buy').setDescription('Купить предмет').addIntegerOption(o => o.setName('item_id').setDescription('ID предмета').setRequired(true)),
-  new SlashCommandBuilder().setName('inventory').setDescription('Показать инвентарь'),
-  new SlashCommandBuilder().setName('capitalization').setDescription('Показать общую капитализацию сервера'),
-  new SlashCommandBuilder().setName('roulette').setDescription('Сделать ставку на число').addIntegerOption(o => o.setName('bet').setDescription('Размер ставки в монетах').setMinValue(1).setRequired(true))
-].map(command => command.toJSON());
-
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildVoiceStates] });
-const redNumbers = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
-const rouletteColor = number => number === 0 ? 'зеро' : redNumbers.has(number) ? 'красное' : 'чёрное';
-const rouletteHistory = () => db.prepare('SELECT number, color FROM roulette_history ORDER BY id DESC LIMIT 10').all();
-const historyText = () => {
-  const history = rouletteHistory();
-  return history.length ? `\nПоследние игры: ${history.map(game => `${game.number} ${game.color === 'красное' ? '🔴' : game.color === 'чёрное' ? '⚫' : '🟢'}`).join(' · ')}\n` : '\nПоследних игр пока нет.\n';
-};
-const roulettePageCount = 3;
-const rouletteRows = (ownerId, bet, page = 0) => {
-  const numbers = Array.from({ length: 37 }, (_, number) => number).slice(page * 15, page * 15 + 15);
-  const rows = [];
-  for (let index = 0; index < numbers.length; index += 5) {
-    rows.push(new ActionRowBuilder().addComponents(numbers.slice(index, index + 5).map(number => new ButtonBuilder()
-      .setCustomId(`roulette-number:${ownerId}:${bet}:${number}:${page}`)
-      .setLabel(String(number))
-      .setStyle(number === 0 ? ButtonStyle.Success : redNumbers.has(number) ? ButtonStyle.Danger : ButtonStyle.Secondary))));
-  }
-  rows.push(new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`roulette-page:${ownerId}:${bet}:${(page + roulettePageCount - 1) % roulettePageCount}`).setLabel('Назад').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`roulette-page-current:${ownerId}:${bet}:${page}`).setLabel(`${page + 1}/${roulettePageCount}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
-    new ButtonBuilder().setCustomId(`roulette-page:${ownerId}:${bet}:${(page + 1) % roulettePageCount}`).setLabel('Далее').setStyle(ButtonStyle.Primary)
-  ));
-  return rows;
-};
-client.once('ready', async () => {
-  console.log(`Discord: ${client.user.tag}`);
-  if (process.env.CLIENT_ID && process.env.GUILD_ID) await new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN).put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), { body: commands });
-});
-client.on('interactionCreate', async interaction => {
-  if (interaction.isButton()) {
-    const parts = interaction.customId.split(':');
-    if (!parts[0].startsWith('roulette')) return;
-    if (parts[1] !== interaction.user.id) return interaction.reply({ content: 'Эта рулетка создана другим игроком.', ephemeral: true });
-    const bet = Number(parts[2]);
-    if (parts[0] === 'roulette-page') return interaction.update({ content: `${historyText()}\n🎰 **Рулетка**\nСтавка: **${bet.toLocaleString()} ✦**\nВыбери число.`, components: rouletteRows(interaction.user.id, bet, Number(parts[3])) });
-    const isNumberBet = parts[0] === 'roulette-number';
-    if (!isNumberBet) return;
-    const selected = parts[3]; const page = Number(parts[4]); const player = ensureUser(interaction.user.id, interaction.user.username);
-    if (player.balance < bet) return interaction.reply({ content: 'Ставка больше твоего баланса.', ephemeral: true });
-    const result = Math.floor(Math.random() * 37); const resultColor = rouletteColor(result);
-    const won = result === Number(selected);
-    const payout = won ? bet * 36 : 0;
-    db.prepare('INSERT INTO roulette_history (number, color, created_at) VALUES (?, ?, ?)').run(result, resultColor, Date.now());
-    db.prepare('UPDATE users SET balance = balance - ? + ? WHERE id = ?').run(bet, payout, player.id);
-    if (won) addXp(player.id, 25);
-    return interaction.update({ content: `${historyText()}\n🎰 Выпало **${result}** — ${resultColor}.\n${won ? `🎉 Выигрыш: **${payout.toLocaleString()} ✦**` : `Потеряно: **${bet.toLocaleString()} ✦**`}\n\nВыбери следующую ставку:`, components: rouletteRows(interaction.user.id, bet, page) });
-  }
-  if (!interaction.isChatInputCommand()) return;
-  const user = ensureUser(interaction.user.id, interaction.user.username);
-  if (interaction.commandName === 'balance') return interaction.reply(`**${interaction.user.username}**\nБаланс: **${user.balance.toLocaleString()} ✦**\nУровень: **${user.level}** · XP: ${user.xp % 500}/500`);
-  if (interaction.commandName === 'capitalization') {
-    const coins = db.prepare('SELECT COALESCE(SUM(balance), 0) total FROM users').get().total;
-    const items = db.prepare('SELECT COALESCE(SUM(inv.quantity * i.price), 0) total FROM inventory inv JOIN items i ON i.id = inv.item_id').get().total;
-    return interaction.reply(`**Капитализация сервера**\nМонеты на балансах: **${coins.toLocaleString()} ✦**\nСтоимость предметов: **${items.toLocaleString()} ✦**\nИтого: **${(coins + items).toLocaleString()} ✦**`);
-  }
-  if (interaction.commandName === 'roulette') {
-    const bet = interaction.options.getInteger('bet');
-    if (user.balance < bet) return interaction.reply({ content: `Для ставки нужно ещё ${(bet - user.balance).toLocaleString()} ✦.`, ephemeral: true });
-    return interaction.reply({ content: `${historyText()}\n🎰 **Рулетка**\nСтавка: **${bet.toLocaleString()} ✦**\nВыбери число. Точное совпадение выплачивается с коэффициентом 36x.`, components: rouletteRows(user.id, bet) });
-  }
-  if (interaction.commandName === 'daily') {
-    if (Date.now() - user.last_daily < 86400000) return interaction.reply({ content: 'Ты уже забрал daily. Возвращайся завтра.', ephemeral: true });
-    const reward = 250 + user.level * 50;
-    db.prepare('UPDATE users SET balance = balance + ?, last_daily = ? WHERE id = ?').run(reward, Date.now(), user.id); addXp(user.id, 50);
-    return interaction.reply(`Ежедневная награда: **+${reward} ✦** и **+50 XP**. Стрик продолжается!`);
-  }
-  if (interaction.commandName === 'shop') {
-    const items = db.prepare('SELECT * FROM items WHERE active = 1').all();
-    return interaction.reply(items.map(i => `**#${i.id} ${i.icon} ${i.name}** — ${i.price.toLocaleString()} ✦${i.stock >= 0 ? ` · осталось ${i.stock}` : ''}\n${i.description}`).join('\n\n') || 'Магазин пуст.');
-  }
-  if (interaction.commandName === 'inventory') {
-    const items = db.prepare('SELECT i.name, i.icon, inv.quantity FROM inventory inv JOIN items i ON i.id = inv.item_id WHERE inv.user_id = ? AND inv.quantity > 0').all(user.id);
-    return interaction.reply(items.length ? items.map(i => `${i.icon} **${i.name}** ×${i.quantity}`).join('\n') : 'Инвентарь пуст.');
-  }
-  if (interaction.commandName === 'buy') {
-    const id = interaction.options.getInteger('item_id'); const item = db.prepare('SELECT * FROM items WHERE id = ? AND active = 1').get(id);
-    if (!item || (item.stock === 0)) return interaction.reply({ content: 'Предмет недоступен.', ephemeral: true });
-    if (user.balance < item.price) return interaction.reply({ content: `Нужно ещё ${(item.price - user.balance).toLocaleString()} ✦.`, ephemeral: true });
-    const buy = db.transaction(() => { db.prepare('UPDATE users SET balance = balance - ? WHERE id = ?').run(item.price, user.id); db.prepare('INSERT INTO inventory (user_id, item_id, quantity) VALUES (?, ?, 1) ON CONFLICT(user_id, item_id) DO UPDATE SET quantity = quantity + 1').run(user.id, item.id); if (item.stock > 0) db.prepare('UPDATE items SET stock = stock - 1 WHERE id = ?').run(item.id); addXp(user.id, 15); }); buy();
-    return interaction.reply(`Куплено: ${item.icon} **${item.name}** за ${item.price.toLocaleString()} ✦.`);
-  }
-});
-
-client.on('messageCreate', message => {
-  if (message.author.bot || !message.guild) return;
-  const user = ensureUser(message.author.id, message.author.username);
-  if (Date.now() - user.last_message_reward < 60000) return;
-  db.prepare('UPDATE users SET balance = balance + 5, last_message_reward = ? WHERE id = ?').run(Date.now(), user.id);
-  addXp(user.id, 10);
-});
-
-const rewardVoiceMembers = () => {
-  for (const guild of client.guilds.cache.values()) {
-    for (const channel of guild.channels.cache.filter(channel => channel.isVoiceBased()).values()) {
-      for (const member of channel.members.values()) {
-        if (member.user.bot || member.voice.selfDeaf && member.voice.serverDeaf) continue;
-        const user = ensureUser(member.id, member.user.username);
-        if (Date.now() - user.last_voice_reward < 300000) continue;
-        db.prepare('UPDATE users SET balance = balance + 10, last_voice_reward = ? WHERE id = ?').run(Date.now(), member.id);
-        addXp(member.id, 20);
-      }
-    }
-  }
-};
-client.once('ready', () => setInterval(rewardVoiceMembers, 60000));
-
-app.listen(port, () => console.log(`Admin panel: http://localhost:${port}`));
-if (process.env.DISCORD_TOKEN) client.login(process.env.DISCORD_TOKEN).catch(error => console.error('Discord login failed:', error.message));
+const commands = [new SlashCommandBuilder().setName('balance').setDescription('Показать баланс и уровень'), new SlashCommandBuilder().setName('daily').setDescription('Получить ежедневную награду'), new SlashCommandBuilder().setName('shop').setDescription('Открыть магазин предметов'), new SlashCommandBuilder().setName('buy').setDescription('Купить предмет').addIntegerOption(o => o.setName('item_id').setDescription('ID предмета').setRequired(true)), new SlashCommandBuilder().setName('inventory').setDescription('Показать инвентарь'), new SlashCommandBuilder().setName('capitalization').setDescription('Показать общую капитализацию сервера'), new SlashCommandBuilder().setName('roulette').setDescription('Сделать ставку на число').addIntegerOption(o => o.setName('bet').setDescription('Размер ставки в монетах').setMinValue(1).setRequired(true)), new SlashCommandBuilder().setName('profile').setDescription('Показать игровой профиль').addUserOption(o => o.setName('user').setDescription('Участник')), new SlashCommandBuilder().setName('leaderboard').setDescription('Показать рейтинг').addStringOption(o => o.setName('type').setDescription('Рейтинг').addChoices({ name: 'Богатство', value: 'balance' }, { name: 'Уровень', value: 'level' }, { name: 'Игры', value: 'games' })), new SlashCommandBuilder().setName('transfer').setDescription('Передать монеты').addUserOption(o => o.setName('user').setDescription('Получатель').setRequired(true)).addIntegerOption(o => o.setName('amount').setDescription('Сумма').setMinValue(1).setRequired(true)), new SlashCommandBuilder().setName('weekly').setDescription('Получить еженедельную награду'), new SlashCommandBuilder().setName('promo').setDescription('Активировать промокод').addStringOption(o => o.setName('code').setDescription('Код').setRequired(true)), new SlashCommandBuilder().setName('coin').setDescription('Монетка').addIntegerOption(o => o.setName('bet').setDescription('Ставка').setMinValue(1).setRequired(true)).addStringOption(o => o.setName('side').setDescription('Сторона').setRequired(true).addChoices({ name: 'Орёл', value: 'heads' }, { name: 'Решка', value: 'tails' })), new SlashCommandBuilder().setName('dice').setDescription('Кости: 4–6 выигрывает').addIntegerOption(o => o.setName('bet').setDescription('Ставка').setMinValue(1).setRequired(true)), new SlashCommandBuilder().setName('slots').setDescription('Слот-машина').addIntegerOption(o => o.setName('bet').setDescription('Ставка').setMinValue(1).setRequired(true)), new SlashCommandBuilder().setName('reputation').setDescription('Поблагодарить участника').addUserOption(o => o.setName('user').setDescription('Участник').setRequired(true)), new SlashCommandBuilder().setName('sell').setDescription('Продать предмет боту').addIntegerOption(o => o.setName('item_id').setDescription('ID предмета').setRequired(true)).addIntegerOption(o => o.setName('quantity').setDescription('Количество').setMinValue(1).setRequired(true)), new SlashCommandBuilder().setName('case').setDescription('Открыть кейс').addIntegerOption(o => o.setName('bet').setDescription('Цена открытия').setMinValue(100).setRequired(true)), new SlashCommandBuilder().setName('auction-create').setDescription('Выставить предмет на продажу').addIntegerOption(o => o.setName('item_id').setDescription('ID предмета').setRequired(true)).addIntegerOption(o => o.setName('quantity').setDescription('Количество').setMinValue(1).setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Цена').setMinValue(1).setRequired(true)), new SlashCommandBuilder().setName('auction-list').setDescription('Показать активные лоты'), new SlashCommandBuilder().setName('auction-buy').setDescription('Купить лот').addIntegerOption(o => o.setName('id').setDescription('ID лота').setRequired(true))].map(command => command.toJSON());
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildVoiceStates] }); const redNumbers = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]); const rouletteColor = number => number === 0 ? 'зеро' : redNumbers.has(number) ? 'красное' : 'чёрное'; const roulettePageCount = 3;
+const rouletteHistory = () => collections.roulette_history.find({}, { sort: { id: -1 }, limit: 10, projection: { _id: 0, number: 1, color: 1 } });
+const rouletteText = async (balance, bet, extra = 'Выбери число.') => { const history = await rouletteHistory(); return `${history.length ? `\nПоследние игры: ${history.map(game => `${game.number} ${game.color === 'красное' ? '🔴' : game.color === 'чёрное' ? '⚫' : '🟢'}`).join(' · ')}\n` : '\nПоследних игр пока нет.\n'}\n🎰 **Рулетка**\nСтавка: **${bet.toLocaleString()} ✦** · Баланс: **${balance.toLocaleString()} ✦**\n${extra}`; };
+const rouletteRows = (ownerId, bet, page = 0) => { const numbers = Array.from({ length: 37 }, (_, number) => number).slice(page * 15, page * 15 + 15); const rows = []; for (let index = 0; index < numbers.length; index += 5) rows.push(new ActionRowBuilder().addComponents(numbers.slice(index, index + 5).map(number => new ButtonBuilder().setCustomId(`roulette-number:${ownerId}:${bet}:${number}:${page}`).setLabel(String(number)).setStyle(number === 0 ? ButtonStyle.Success : redNumbers.has(number) ? ButtonStyle.Danger : ButtonStyle.Secondary)))); rows.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`roulette-page:${ownerId}:${bet}:${(page + 2) % 3}`).setLabel('Назад').setStyle(ButtonStyle.Primary), new ButtonBuilder().setCustomId(`roulette-page-current:${ownerId}:${bet}:${page}`).setLabel(`${page + 1}/3`).setStyle(ButtonStyle.Secondary).setDisabled(true), new ButtonBuilder().setCustomId(`roulette-page:${ownerId}:${bet}:${(page + 1) % 3}`).setLabel('Далее').setStyle(ButtonStyle.Primary), new ButtonBuilder().setCustomId(`roulette-bet:${ownerId}:${bet}:${page}`).setLabel('Изменить ставку').setStyle(ButtonStyle.Success))); return rows; };
+const achievementNames = { first_game: 'Первая игра', high_roller: 'Крупная ставка', first_purchase: 'Первая покупка', daily_week: 'Неделя наград', level_five: 'Пятый уровень' };
+async function checkAchievements(userId) { const user = await users().findOne({ _id: userId }); const [games] = await gameStats().aggregate([{ $match: { user_id: userId } }, { $group: { _id: null, total: { $sum: '$played' }, wagered: { $max: '$wagered' } } }]); const [owned] = await inventory().aggregate([{ $match: { user_id: userId } }, { $group: { _id: null, total: { $sum: '$quantity' } } }]); const unlocked = []; if ((games?.total || 0) >= 1 && await unlockAchievement(userId, 'first_game')) unlocked.push(achievementNames.first_game); if ((games?.wagered || 0) >= 1000 && await unlockAchievement(userId, 'high_roller')) unlocked.push(achievementNames.high_roller); if ((owned?.total || 0) >= 1 && await unlockAchievement(userId, 'first_purchase')) unlocked.push(achievementNames.first_purchase); if (user.daily_streak >= 7 && await unlockAchievement(userId, 'daily_week')) unlocked.push(achievementNames.daily_week); if (user.level >= 5 && await unlockAchievement(userId, 'level_five')) unlocked.push(achievementNames.level_five); return unlocked; }
+async function gameResult(user, game, bet, payout, text) { await users().updateOne({ _id: user.id }, { $inc: { balance: payout - bet } }); await recordGame(user.id, game, bet, payout); if (payout > bet) await addXp(user.id, 15); const player = await users().findOne({ _id: user.id }); const unlocked = await checkAchievements(user.id); return `${text}\nБаланс: **${player.balance.toLocaleString()} ✦**${unlocked.length ? `\n🏆 Достижение: **${unlocked.join(', ')}**` : ''}`; }
+client.once('ready', async () => { console.log(`Discord: ${client.user.tag}`); if (process.env.CLIENT_ID && process.env.GUILD_ID) await new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN).put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), { body: commands }); });
+client.on('interactionCreate', async interaction => { try {
+  if (interaction.isButton()) { const parts = interaction.customId.split(':'); if (!parts[0].startsWith('roulette')) return; if (parts[1] !== interaction.user.id) return interaction.reply({ content: 'Эта рулетка создана другим игроком.', ephemeral: true }); const bet = Number(parts[2]); const player = await ensureUser(interaction.user.id, interaction.user.username); if (parts[0] === 'roulette-page') return interaction.update({ content: await rouletteText(player.balance, bet), components: rouletteRows(player.id, bet, Number(parts[3])) }); if (parts[0] === 'roulette-bet') { const input = new TextInputBuilder().setCustomId('bet').setLabel('Сумма ставки').setStyle(TextInputStyle.Short).setValue(String(bet)).setRequired(true); return interaction.showModal(new ModalBuilder().setCustomId(`roulette-bet-modal:${player.id}:${parts[3]}`).setTitle('Изменить ставку').addComponents(new ActionRowBuilder().addComponents(input))); } if (parts[0] !== 'roulette-number') return; const selected = Number(parts[3]); if (player.balance < bet) return interaction.reply({ content: 'Ставка больше твоего баланса.', ephemeral: true }); const result = Math.floor(Math.random() * 37); const resultColor = rouletteColor(result); const won = result === selected; const payout = won ? bet * 36 : 0; await collections.roulette_history.insertOne({ number: result, color: resultColor, created_at: Date.now() }); const message = await gameResult(player, 'roulette', bet, payout, `Выпало **${result}** — ${resultColor}.\n${won ? `🎉 Выигрыш: **${payout.toLocaleString()} ✦**` : `Потеряно: **${bet.toLocaleString()} ✦**`}\n\nВыбери следующую ставку:`); return interaction.update({ content: await rouletteText((await users().findOne({ _id: player.id })).balance, bet, message), components: rouletteRows(player.id, bet, Number(parts[4])) }); }
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('roulette-bet-modal:')) { const [, ownerId, page] = interaction.customId.split(':'); if (ownerId !== interaction.user.id) return interaction.reply({ content: 'Эта рулетка создана другим игроком.', ephemeral: true }); const bet = Number(interaction.fields.getTextInputValue('bet')); const player = await ensureUser(ownerId, interaction.user.username); if (!Number.isInteger(bet) || bet < 1) return interaction.reply({ content: 'Укажи целую ставку от 1 ✦.', ephemeral: true }); if (player.balance < bet) return interaction.reply({ content: 'Ставка больше твоего баланса.', ephemeral: true }); return interaction.update({ content: await rouletteText(player.balance, bet), components: rouletteRows(player.id, bet, Number(page)) }); }
+  if (!interaction.isChatInputCommand()) return; const user = await ensureUser(interaction.user.id, interaction.user.username); const command = interaction.commandName;
+  if (command === 'balance') return interaction.reply(`**${interaction.user.username}**\nБаланс: **${user.balance.toLocaleString()} ✦**\nУровень: **${user.level}** · XP: ${user.xp % 500}/500`);
+  if (command === 'profile') { const member = interaction.options.getUser('user') || interaction.user; const profile = await ensureUser(member.id, member.username); const [games] = await gameStats().aggregate([{ $match: { user_id: profile.id } }, { $group: { _id: null, played: { $sum: '$played' }, wagered: { $sum: '$wagered' }, payout: { $sum: '$payout' } } }]); const unlocked = await achievements().find({ user_id: profile.id }, { sort: { unlocked_at: 1 } }); return interaction.reply(`**Профиль ${member.username}**\nБаланс: **${profile.balance.toLocaleString()} ✦** · Уровень: **${profile.level}**\nXP: ${profile.xp % 500}/500 · Daily-стрик: **${profile.daily_streak}**\nИгры: ${games?.played || 0} · Поставлено: ${(games?.wagered || 0).toLocaleString()} ✦ · Прибыль: ${((games?.payout || 0) - (games?.wagered || 0)).toLocaleString()} ✦\nДостижения: ${unlocked.length ? unlocked.map(row => achievementNames[row.code] || row.code).join(' · ') : 'пока нет'}`); }
+  if (command === 'leaderboard') { const type = interaction.options.getString('type') || 'balance'; const rows = type === 'games' ? await gameStats().aggregate([{ $group: { _id: '$user_id', value: { $sum: '$played' } } }, { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'user' } }, { $unwind: '$user' }, { $project: { _id: 0, username: '$user.username', value: 1 } }, { $sort: { value: -1, username: 1 } }, { $limit: 10 }]) : await users().find({}, { sort: { [type]: -1, username: 1 }, limit: 10, projection: { _id: 0, username: 1, [type]: 1 } }); if (type !== 'games') rows.forEach(row => { row.value = row[type]; }); return interaction.reply(`**Топ: ${type === 'games' ? 'Количество игр' : type === 'level' ? 'Уровень' : 'Баланс'}**\n${rows.map((row, index) => `${index + 1}. **${row.username}** — ${Number(row.value).toLocaleString()}${type === 'balance' ? ' ✦' : ''}`).join('\n') || 'Пока пусто.'}`); }
+  if (command === 'capitalization') { const [coins] = await users().aggregate([{ $group: { _id: null, total: { $sum: '$balance' } } }]); const rows = await inventory().aggregate([{ $lookup: { from: 'items', localField: 'item_id', foreignField: 'id', as: 'item' } }, { $unwind: '$item' }, { $group: { _id: null, total: { $sum: { $multiply: ['$quantity', '$item.price'] } } } }]); const totalItems = rows[0]?.total || 0; return interaction.reply(`**Капитализация сервера**\nМонеты на балансах: **${(coins?.total || 0).toLocaleString()} ✦**\nСтоимость предметов: **${totalItems.toLocaleString()} ✦**\nИтого: **${((coins?.total || 0) + totalItems).toLocaleString()} ✦**`); }
+  if (command === 'roulette') { const bet = interaction.options.getInteger('bet'); if (user.balance < bet) return interaction.reply({ content: `Для ставки нужно ещё ${(bet - user.balance).toLocaleString()} ✦.`, ephemeral: true }); return interaction.reply({ content: await rouletteText(user.balance, bet, 'Выбери число. Точное совпадение выплачивается с коэффициентом 36x.'), components: rouletteRows(user.id, bet) }); }
+  if (command === 'daily' || command === 'weekly') { const weekly = command === 'weekly'; const last = weekly ? user.last_weekly : user.last_daily; const period = weekly ? 604800000 : 86400000; if (Date.now() - last < period) return interaction.reply({ content: weekly ? 'Еженедельная награда уже получена.' : 'Ты уже забрал daily. Возвращайся завтра.', ephemeral: true }); const streak = weekly ? null : Date.now() - last < 172800000 ? user.daily_streak + 1 : 1; const reward = weekly ? 1500 + user.level * 100 : 250 + user.level * 50 + Math.min(streak, 7) * 25; await users().updateOne({ _id: user.id }, { $inc: { balance: reward }, $set: weekly ? { last_weekly: Date.now() } : { last_daily: Date.now(), daily_streak: streak } }); await addXp(user.id, weekly ? 100 : 50); const unlocked = weekly ? [] : await checkAchievements(user.id); return interaction.reply(`${weekly ? 'Еженедельная' : 'Ежедневная'} награда: **+${reward.toLocaleString()} ✦** и **+${weekly ? 100 : 50} XP**.${weekly ? '' : ` Стрик: **${streak}**.${unlocked.length ? `\n🏆 Достижение: **${unlocked.join(', ')}**` : ''}`}`); }
+  if (command === 'transfer') { const receiver = interaction.options.getUser('user'); const amount = interaction.options.getInteger('amount'); if (receiver.bot || receiver.id === user.id) return interaction.reply({ content: 'Выбери другого участника.', ephemeral: true }); if (user.balance < amount) return interaction.reply({ content: 'Недостаточно монет.', ephemeral: true }); const target = await ensureUser(receiver.id, receiver.username); await users().updateOne({ _id: user.id, balance: { $gte: amount } }, { $inc: { balance: -amount } }); await users().updateOne({ _id: target.id }, { $inc: { balance: amount } }); await logAudit('transfer', user.id, amount, `Получатель ${target.id}`); return interaction.reply(`Передано **${amount.toLocaleString()} ✦** пользователю **${receiver.username}**.`); }
+  if (command === 'promo') { const code = interaction.options.getString('code').trim().toUpperCase(); const promo = await promos().findOne({ _id: code, active: 1 }); if (!promo || promo.uses >= promo.max_uses || (promo.expires_at && promo.expires_at < Date.now())) return interaction.reply({ content: 'Промокод недействителен.', ephemeral: true }); try { await claims().insertOne({ _id: `${code}:${user.id}`, code, user_id: user.id, claimed_at: Date.now() }); } catch (error) { if (error.code === 11000) return interaction.reply({ content: 'Ты уже активировал этот промокод.', ephemeral: true }); throw error; } const used = await promos().updateOne({ _id: code, uses: { $lt: promo.max_uses } }, { $inc: { uses: 1 } }); if (!used.modifiedCount) return interaction.reply({ content: 'Промокод недействителен.', ephemeral: true }); await users().updateOne({ _id: user.id }, { $inc: { balance: promo.reward } }); await logAudit('promo_claim', user.id, promo.reward, code); return interaction.reply(`Промокод **${code}** активирован: **+${promo.reward.toLocaleString()} ✦**.`); }
+  if (['coin', 'dice', 'slots', 'case'].includes(command)) { const bet = interaction.options.getInteger('bet'); if (user.balance < bet) return interaction.reply({ content: 'Ставка больше твоего баланса.', ephemeral: true }); if (command === 'coin') { const result = Math.random() < .5 ? 'heads' : 'tails'; const won = interaction.options.getString('side') === result; return interaction.reply(await gameResult(user, 'coin', bet, won ? bet * 2 : 0, `🪙 Выпало **${result === 'heads' ? 'орёл' : 'решка'}**. ${won ? `Выигрыш: **${(bet * 2).toLocaleString()} ✦**` : `Потеряно: **${bet.toLocaleString()} ✦**`}`)); } if (command === 'dice') { const roll = Math.floor(Math.random() * 6) + 1; return interaction.reply(await gameResult(user, 'dice', bet, roll >= 4 ? bet * 2 : 0, `🎲 Выпало **${roll}**. ${roll >= 4 ? `Выигрыш: **${(bet * 2).toLocaleString()} ✦**` : `Потеряно: **${bet.toLocaleString()} ✦**`}`)); } if (command === 'slots') { const symbols = ['🍒', '🍋', '💎', '7️⃣']; const result = Array.from({ length: 3 }, () => symbols[Math.floor(Math.random() * symbols.length)]); const payout = result[0] === result[1] && result[1] === result[2] ? bet * (result[0] === '7️⃣' ? 10 : 4) : result[0] === result[1] || result[1] === result[2] || result[0] === result[2] ? bet * 2 : 0; return interaction.reply(await gameResult(user, 'slots', bet, payout, `🎰 ${result.join(' | ')}\n${payout ? `Выигрыш: **${payout.toLocaleString()} ✦**` : `Потеряно: **${bet.toLocaleString()} ✦**`}`)); } const prize = Math.floor(bet * (.5 + Math.random() * 2.5)); return interaction.reply(await gameResult(user, 'case', bet, prize, `▣ Кейс открыт. Получено: **${prize.toLocaleString()} ✦**.`)); }
+  if (command === 'shop') { const shop = await items().find({ active: 1 }); return interaction.reply(shop.map(i => `**#${i.id} ${i.icon} ${i.name}** — ${i.price.toLocaleString()} ✦${i.stock >= 0 ? ` · осталось ${i.stock}` : ''}\n${i.description}`).join('\n\n') || 'Магазин пуст.'); }
+  if (command === 'inventory') { const owned = await inventory().aggregate([{ $match: { user_id: user.id, quantity: { $gt: 0 } } }, { $lookup: { from: 'items', localField: 'item_id', foreignField: 'id', as: 'item' } }, { $unwind: '$item' }, { $project: { name: '$item.name', icon: '$item.icon', quantity: 1 } }]); return interaction.reply(owned.length ? owned.map(i => `${i.icon} **${i.name}** ×${i.quantity}`).join('\n') : 'Инвентарь пуст.'); }
+  if (command === 'buy' || command === 'sell' || command === 'auction-create') { const itemId = interaction.options.getInteger('item_id'); const item = await items().findOne({ id: itemId }); const quantity = command === 'buy' ? 1 : interaction.options.getInteger('quantity'); const owned = command === 'buy' ? null : await inventory().findOne({ user_id: user.id, item_id: itemId }); if (!item || (command === 'buy' && (!item.active || item.stock === 0)) || (command !== 'buy' && (!owned || owned.quantity < quantity))) return interaction.reply({ content: command === 'buy' ? 'Предмет недоступен.' : 'У тебя нет такого количества предметов.', ephemeral: true }); if (command === 'buy') { if (user.balance < item.price) return interaction.reply({ content: `Нужно ещё ${(item.price - user.balance).toLocaleString()} ✦.`, ephemeral: true }); await users().updateOne({ _id: user.id }, { $inc: { balance: -item.price } }); await inventory().updateOne({ user_id: user.id, item_id: item.id }, { $inc: { quantity: 1 }, $setOnInsert: { _id: `${user.id}:${item.id}`, user_id: user.id, item_id: item.id } }, { upsert: true }); if (item.stock > 0) await items().updateOne({ id: item.id }, { $inc: { stock: -1 } }); await addXp(user.id, 15); await logAudit('shop_purchase', user.id, item.price, `Предмет #${item.id}`); const unlocked = await checkAchievements(user.id); return interaction.reply(`Куплено: ${item.icon} **${item.name}** за ${item.price.toLocaleString()} ✦.${unlocked.length ? `\n🏆 Достижение: **${unlocked.join(', ')}**` : ''}`); } if (command === 'sell') { const reward = Math.floor(item.price * quantity * .5); await inventory().updateOne({ user_id: user.id, item_id: itemId }, { $inc: { quantity: -quantity } }); await users().updateOne({ _id: user.id }, { $inc: { balance: reward } }); await logAudit('item_sell', user.id, reward, `Предмет #${itemId} x${quantity}`); return interaction.reply(`Продано: ${item.icon} **${item.name}** ×${quantity} за **${reward.toLocaleString()} ✦**.`); } await inventory().updateOne({ user_id: user.id, item_id: itemId }, { $inc: { quantity: -quantity } }); const lot = { seller_id: user.id, item_id: itemId, quantity, price: interaction.options.getInteger('price'), active: 1, created_at: Date.now() }; await auctions().insertOne(lot); return interaction.reply(`Лот **#${lot.id}**: ${item.icon} **${item.name}** ×${quantity} за **${lot.price.toLocaleString()} ✦**.`); }
+  if (command === 'auction-list') { const lots = await auctions().aggregate([{ $match: { active: 1 } }, { $sort: { id: -1 } }, { $limit: 20 }, { $lookup: { from: 'items', localField: 'item_id', foreignField: 'id', as: 'item' } }, { $lookup: { from: 'users', localField: 'seller_id', foreignField: '_id', as: 'seller' } }, { $unwind: '$item' }, { $unwind: '$seller' }]); return interaction.reply(lots.length ? `**Аукцион**\n${lots.map(lot => `#${lot.id} ${lot.item.icon} **${lot.item.name}** ×${lot.quantity} — **${lot.price.toLocaleString()} ✦** · ${lot.seller.username}`).join('\n')}` : 'Активных лотов нет.'); }
+  if (command === 'auction-buy') { const id = interaction.options.getInteger('id'); const lot = await auctions().findOne({ id, active: 1 }); if (!lot) return interaction.reply({ content: 'Лот недоступен.', ephemeral: true }); if (lot.seller_id === user.id) return interaction.reply({ content: 'Нельзя купить собственный лот.', ephemeral: true }); if (user.balance < lot.price) return interaction.reply({ content: 'Недостаточно монет.', ephemeral: true }); const claimed = await auctions().updateOne({ id, active: 1 }, { $set: { active: 0 } }); if (!claimed.modifiedCount) return interaction.reply({ content: 'Лот недоступен.', ephemeral: true }); await users().updateOne({ _id: user.id }, { $inc: { balance: -lot.price } }); await users().updateOne({ _id: lot.seller_id }, { $inc: { balance: lot.price } }); await inventory().updateOne({ user_id: user.id, item_id: lot.item_id }, { $inc: { quantity: lot.quantity }, $setOnInsert: { _id: `${user.id}:${lot.item_id}`, user_id: user.id, item_id: lot.item_id } }, { upsert: true }); await logAudit('auction_buy', user.id, lot.price, `Лот #${id}`); return interaction.reply(`Лот **#${id}** куплен за **${lot.price.toLocaleString()} ✦**.`); }
+  if (command === 'reputation') { const target = interaction.options.getUser('user'); if (target.bot || target.id === user.id) return interaction.reply({ content: 'Выбери другого участника.', ephemeral: true }); if (Date.now() - user.last_reputation < 86400000) return interaction.reply({ content: 'Благодарность доступна раз в сутки.', ephemeral: true }); const recipient = await ensureUser(target.id, target.username); await users().updateOne({ _id: user.id }, { $set: { last_reputation: Date.now() } }); await users().updateOne({ _id: recipient.id }, { $inc: { balance: 25 } }); await logAudit('reputation', user.id, 25, `Получатель ${recipient.id}`); return interaction.reply(`**${target.username}** получает **+25 ✦** за благодарность.`); }
+} catch (error) { console.error('Interaction failed:', error); if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) interaction.reply({ content: 'Произошла ошибка. Попробуй ещё раз.', ephemeral: true }); } });
+client.on('messageCreate', async message => { if (message.author.bot || !message.guild) return; const user = await ensureUser(message.author.id, message.author.username); if (Date.now() - user.last_message_reward < 60000) return; await users().updateOne({ _id: user.id }, { $inc: { balance: 5 }, $set: { last_message_reward: Date.now() } }); await addXp(user.id, 10); });
+const rewardVoiceMembers = async () => { for (const guild of client.guilds.cache.values()) for (const channel of guild.channels.cache.filter(channel => channel.isVoiceBased()).values()) for (const member of channel.members.values()) { if (member.user.bot || member.voice.selfDeaf && member.voice.serverDeaf) continue; const user = await ensureUser(member.id, member.user.username); if (Date.now() - user.last_voice_reward < 300000) continue; await users().updateOne({ _id: user.id }, { $inc: { balance: 10 }, $set: { last_voice_reward: Date.now() } }); await addXp(user.id, 20); } };
+client.once('ready', () => setInterval(() => rewardVoiceMembers().catch(error => console.error('Voice rewards failed:', error)), 60000));
+async function start() { await connectDb(); app.listen(port, () => console.log(`Admin panel: http://localhost:${port}`)); if (process.env.DISCORD_TOKEN) client.login(process.env.DISCORD_TOKEN).catch(error => console.error('Discord login failed:', error.message)); }
+start().catch(error => { console.error('Startup failed:', error.message); process.exitCode = 1; });
