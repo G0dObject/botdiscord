@@ -47,3 +47,9 @@ Discord-бот экономики с уровнями, XP, магазином п
 7. Открыть `http://localhost:3000`.
 
 Для разработки доступен `npm run dev`.
+
+## Railway
+
+- Railway должен использовать Node.js 22 (это закреплено в `.nvmrc` и `package.json`).
+- Добавь в Variables `MONGODB_URI`, `DISCORD_TOKEN`, `CLIENT_ID`, `GUILD_ID`, `ADMIN_PASSWORD` и `JWT_SECRET`.
+- В MongoDB Atlas разреши подключение Railway через `Network Access` (`0.0.0.0/0` для временной настройки).
