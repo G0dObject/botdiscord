@@ -5,6 +5,7 @@ const databaseName = 'guildforge';
 let client;
 let database;
 let connection;
+let lastConnectionError = null;
 
 const defaultItems = [
   ['Эликсир удачи', 'Увеличивает награду за daily на 25%.', 750, '✦', 25],
@@ -21,6 +22,7 @@ async function connectDb() {
     client = new MongoClient(uri, { serverSelectionTimeoutMS: 10000 });
     await client.connect();
     database = client.db(databaseName);
+    lastConnectionError = null;
     await Promise.all([
       database.collection('inventory').createIndex({ user_id: 1, item_id: 1 }, { unique: true }),
       database.collection('game_stats').createIndex({ user_id: 1, game: 1 }, { unique: true }),
@@ -36,12 +38,17 @@ async function connectDb() {
   try {
     return await connection;
   } catch (error) {
+    lastConnectionError = error.message;
     connection = null;
     database = null;
     if (client) await client.close().catch(() => {});
     client = null;
     throw error;
   }
+}
+
+function getDbStatus() {
+  return { connected: Boolean(database), error: lastConnectionError };
 }
 
 function db() {
@@ -110,4 +117,4 @@ const collection = name => ({
 });
 
 const collections = new Proxy({}, { get: (_, name) => collection(name) });
-module.exports = { connectDb, collections, ensureUser, addXp, logAudit, recordGame, unlockAchievement };
+module.exports = { connectDb, getDbStatus, collections, ensureUser, addXp, logAudit, recordGame, unlockAchievement };

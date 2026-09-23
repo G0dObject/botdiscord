@@ -3,7 +3,7 @@ const path = require('path');
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
-const { connectDb, collections, ensureUser, addXp, logAudit, recordGame, unlockAchievement } = require('./db');
+const { connectDb, getDbStatus, collections, ensureUser, addXp, logAudit, recordGame, unlockAchievement } = require('./db');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -20,6 +20,10 @@ app.use(express.json()); app.use(express.static(path.join(__dirname, '..', 'publ
 const auth = (req, res, next) => { const token = (req.headers.authorization || '').replace('Bearer ', ''); try { req.admin = jwt.verify(token, jwtSecret); next(); } catch { res.status(401).json({ error: 'Требуется авторизация' }); } };
 
 app.post('/api/login', (req, res) => { if (!process.env.ADMIN_PASSWORD || req.body.password !== process.env.ADMIN_PASSWORD) return res.status(401).json({ error: 'Неверный пароль' }); res.json({ token: jwt.sign({ role: 'admin' }, jwtSecret, { expiresIn: '12h' }) }); });
+app.get('/api/health', (req, res) => {
+  const mongo = getDbStatus();
+  res.status(mongo.connected ? 200 : 503).json({ ok: mongo.connected, mongo });
+});
 app.get('/api/stats', auth, async (req, res, next) => { try { const [stats] = await users().aggregate([{ $group: { _id: null, users: { $sum: 1 }, balance: { $sum: '$balance' }, level: { $avg: '$level' } } }]); const [purchases] = await inventory().aggregate([{ $group: { _id: null, total: { $sum: '$quantity' } } }]); res.json({ users: stats?.users || 0, balance: stats?.balance || 0, averageLevel: Number(stats?.level || 0).toFixed(1), purchases: purchases?.total || 0 }); } catch (error) { next(error); } });
 app.get('/api/users', auth, async (req, res, next) => { try { res.json(await users().find({}, { sort: { balance: -1 }, limit: 100, projection: { _id: 0 } })); } catch (error) { next(error); } });
 app.post('/api/users/:id/balance', auth, async (req, res, next) => { try { const amount = Number(req.body.amount); if (!Number.isInteger(amount) || amount === 0) return res.status(400).json({ error: 'Укажи целое ненулевое количество монет' }); await ensureUser(req.params.id, req.body.username || 'Unknown'); await users().updateOne({ _id: req.params.id }, [{ $set: { balance: { $max: [0, { $add: ['$balance', amount] }] } } }]); await logAudit('balance_adjustment', req.params.id, amount, 'Админ-панель'); res.json(await users().findOne({ _id: req.params.id }, { projection: { _id: 0 } })); } catch (error) { next(error); } });
