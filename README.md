@@ -44,6 +44,7 @@ Discord-бот экономики с уровнями, XP, магазином п
    - `DISCORD_TOKEN` — токен Discord-приложения.
     - `CLIENT_ID` — Application ID.
     - `DISCORD_CLIENT_SECRET` — Client Secret из OAuth2; нужен для Discord Activity.
+    - `DISCORD_REDIRECT_URI` — OAuth2 Redirect URI для Activity, по умолчанию `https://127.0.0.1`.
    - `GUILD_ID` — ID сервера для быстрой регистрации slash-команд.
    - `ADMIN_PASSWORD` — пароль веб-панели.
    - `JWT_SECRET` — длинная случайная строка.
