@@ -13,6 +13,16 @@
 </head>
 <body>
   <main id="app" class="loading">Подключение к Discord Activity...</main>
+  <script>
+    window.activityBooted = false;
+    window.activityBootWatchdog = setTimeout(() => {
+      if (window.activityBooted) return;
+      const app = document.getElementById('app');
+      app.className = 'loading';
+      app.innerHTML = '<div style="max-width:520px;padding:24px;text-align:center;line-height:1.65"><strong style="display:block;color:#f5f7ff;font-size:20px;margin-bottom:10px">Discord Activity не ответил</strong><span>Открой приложение именно внутри Discord. В Developer Portal проверь URL Mapping: префикс <b>/</b>, публичный HTTPS-домен без пути. Затем перезапусти Discord через <b>Ctrl+R</b>.</span><br><button id="retryActivity" style="margin-top:18px;padding:11px 16px;border:0;border-radius:10px;background:#60efd1;color:#07111d;font-weight:800;cursor:pointer">Повторить подключение</button></div>';
+      document.getElementById('retryActivity').onclick = () => location.reload();
+    }, 8000);
+  </script>
   <script type="module">
     const app = document.getElementById('app');
     const games = {
@@ -84,7 +94,7 @@
       watchRoulette(root, version);
     }
     async function watchRoulette(root, version) { try { const data = await api('/api/activity/roulette'); if (version !== scene || !root.isConnected) return; paintRoulette(root, version, data); if (data.status === 'betting') setTimeout(() => watchRoulette(root, version), 750); } catch {} }
-    function paintRoulette(root, version, data) { if (version !== scene || !root.isConnected) return; const players = root.querySelector('[data-players]'), countdown = root.querySelector('[data-countdown]'), wheel = root.querySelector('.roulette-wheel'); if (!players || !countdown) return; players.innerHTML = data.players.length ? data.players.map(player => `<div class="player"><span>${esc(player.username)} · ${player.choice}</span><b>${player.bet.toLocaleString()} ✦${player.won === true ? ' · выиграл' : player.won === false ? ' · мимо' : ''}</b></div>`).join('') : '<div class="player">Пока никто не поставил</div>'; if (data.status === 'betting') countdown.textContent = `До броска: ${Math.max(0, Math.ceil((data.closesAt - Date.now()) / 1000)} сек.`; else if (data.status === 'settled') { if (!wheel.classList.contains('spun')) { wheel.classList.add('spun'); wheel.style.setProperty('--stop', `${data.result * 9.73}deg`); } countdown.textContent = `Выпало: ${data.result}`; setResult(root, `Рулетка остановилась на ${data.result}.`, 'good'); balance(); } }
+    function paintRoulette(root, version, data) { if (version !== scene || !root.isConnected) return; const players = root.querySelector('[data-players]'), countdown = root.querySelector('[data-countdown]'), wheel = root.querySelector('.roulette-wheel'); if (!players || !countdown) return; players.innerHTML = data.players.length ? data.players.map(player => `<div class="player"><span>${esc(player.username)} · ${player.choice}</span><b>${player.bet.toLocaleString()} ✦${player.won === true ? ' · выиграл' : player.won === false ? ' · мимо' : ''}</b></div>`).join('') : '<div class="player">Пока никто не поставил</div>'; if (data.status === 'betting') countdown.textContent = `До броска: ${Math.max(0, Math.ceil((data.closesAt - Date.now()) / 1000))} сек.`; else if (data.status === 'settled') { if (!wheel.classList.contains('spun')) { wheel.classList.add('spun'); wheel.style.setProperty('--stop', `${data.result * 9.73}deg`); } countdown.textContent = `Выпало: ${data.result}`; setResult(root, `Рулетка остановилась на ${data.result}.`, 'good'); balance(); } }
 
     function renderCrash(root, version, name, hint) {
       root.innerHTML = table(name, hint, controls('', 'Запустить'), 'Ставка списывается на старте. Забери выигрыш до крушения.'); root.querySelector('.play').insertAdjacentHTML('afterend', '<div class="crash-stage"><div class="multiplier">1.00x</div><div class="rocket">↗</div></div>');
@@ -105,10 +115,10 @@
         const { code } = await within(discord.commands.authorize({ client_id:clientId, response_type:'code', state:'', prompt:'none', scope:['identify'] }), 'Авторизация Discord');
         const session = await within(fetch('/api/activity/token', { method:'POST', headers:{ 'Content-Type':'application/json' }, body:JSON.stringify({ code }) }).then(async response => { const data = await response.json(); if (!response.ok) throw new Error(data.error); return data; }), 'Получение игровой сессии');
         await within(discord.commands.authenticate({ access_token:session.access_token }), 'Подтверждение игровой сессии'); token = session.activity_token;
-        app.className = 'shell'; app.innerHTML = `<header class="head"><div class="brand"><b>✦</b> GUILDFORGE ARCADE</div><div id="balance" class="balance"></div></header><div class="layout"><aside class="sidebar"><div class="side-title">Игровые столы</div><div class="games">${Object.entries(games).map(([id, [label,, icon]]) => `<button data-game="${id}" class="${id === current ? 'active' : ''}"><span class="game-icon">${icon}</span>${label}</button>`).join('')}</div></aside><section id="board" class="board"></section></div>`;
+        window.activityBooted = true; clearTimeout(window.activityBootWatchdog); app.className = 'shell'; app.innerHTML = `<header class="head"><div class="brand"><b>✦</b> GUILDFORGE ARCADE</div><div id="balance" class="balance"></div></header><div class="layout"><aside class="sidebar"><div class="side-title">Игровые столы</div><div class="games">${Object.entries(games).map(([id, [label,, icon]]) => `<button data-game="${id}" class="${id === current ? 'active' : ''}"><span class="game-icon">${icon}</span>${label}</button>`).join('')}</div></aside><section id="board" class="board"></section></div>`;
         document.querySelectorAll('[data-game]').forEach(button => button.onclick = () => { current = button.dataset.game; document.querySelectorAll('[data-game]').forEach(item => item.classList.toggle('active', item === button)); render(); });
         await balance(); render();
-      } catch (error) { app.className = 'loading'; app.textContent = `Не удалось запустить Activity: ${error.message}`; }
+      } catch (error) { clearTimeout(window.activityBootWatchdog); app.className = 'loading'; app.innerHTML = `<div style="max-width:520px;padding:24px;text-align:center;line-height:1.65"><strong style="display:block;color:#f5f7ff;font-size:20px;margin-bottom:10px">Не удалось запустить Activity</strong><span>${esc(error.message)}</span><br><button id="retryActivity" style="margin-top:18px;padding:11px 16px;border:0;border-radius:10px;background:#60efd1;color:#07111d;font-weight:800;cursor:pointer">Повторить подключение</button></div>`; document.getElementById('retryActivity').onclick = () => location.reload(); }
     }
     boot();
   </script>
