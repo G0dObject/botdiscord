@@ -1,5 +1,7 @@
 # Guildforge Arcade
 
+The slot reel presentation adapts the server-determined reel concept from [flixrp/HTML-slot-machine-example](https://github.com/flixrp/HTML-slot-machine-example), licensed MIT. The roulette interaction is implemented for the Guildforge economy with reference to [bocaletto-luca/Roulette](https://github.com/bocaletto-luca/Roulette), licensed GPL-3.0. Crash remains an original Guildforge implementation; no code or assets from `akashmahlaz/aviator-crash` are included.
+
 Discord Activity с общей экономикой, аркадными играми и админ-панелью.
 
 ## Возможности
